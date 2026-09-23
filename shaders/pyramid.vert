@@ -1,25 +1,20 @@
 #version 450
 
-layout(location = 0) in vec3 in_position;
-layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec3 in_color;
+layout(location = 0) out vec3 fragColor;
 
-layout(location = 0) out vec3 out_normal;
-layout(location = 1) out vec3 out_color;
-layout(location = 2) out vec3 out_world_position;
+vec2 positions[3] = vec2[](
+    vec2(0.0, -0.5),
+    vec2(0.5, 0.5),
+    vec2(-0.5, 0.5)
+);
 
-layout(push_constant) uniform PushConstants {
-    mat4 model;
-    vec4 color_mult;
-} pc;
-
-layout(set = 0, binding = 0) uniform ObjectUniforms {
-    mat4 mvp;
-} ubo;
+vec3 colors[3] = vec3[](
+    vec3(1.0, 0.0, 0.0),
+    vec3(0.0, 1.0, 0.0),
+    vec3(0.0, 0.0, 1.0)
+);
 
 void main() {
-    gl_Position = ubo.mvp * vec4(in_position, 1.0);
-    out_normal = mat3(pc.model) * in_normal;
-    out_color = in_color;
-    out_world_position = (pc.model * vec4(in_position, 1.0)).xyz;
+    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+    fragColor = colors[gl_VertexIndex];
 }
