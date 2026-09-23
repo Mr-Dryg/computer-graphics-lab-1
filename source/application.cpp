@@ -1,33 +1,14 @@
 #include "application.hpp"
+#include "vulkan/vulkan_core.h"
 
 #include <imgui.h>
 #include <fstream>
 #include <vector>
 #include <iostream>
 
-namespace application {
-
-bool initialize() {
-	return true;
-}
-
-void shutdown() {
-	auto& context = graphics::internal::context;
-	vkQueueWaitIdle(context.graphics_queue);
-}
-
-void update([[maybe_unused]] double time) {
-	ImGui::ShowDemoWindow();
-}
-
-void render(const graphics::internal::FrameData& fd) {
-	(void)fd;
-}
-
-} // namespace application
-
-namespace {
 auto& context = graphics::internal::context;
+VkPipeline graphicPipeline;
+VkPipelineLayout pipelineLayout;
 
 std::vector<char> readFile(const std::string& path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -47,7 +28,10 @@ VkShaderModule createShaderModule(const std::vector<char>& shaderCode) {
 	};
 	VkShaderModule shaderModule;
 
-	if (vkCreateShaderModule(context.device, &shaderModuleCreateInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+	if (vkCreateShaderModule(
+		context.device, &shaderModuleCreateInfo,
+		nullptr, &shaderModule
+	) != VK_SUCCESS) {
 		std::cerr << "Failed to create Vulkan shader module\n";
 		return nullptr;
 	}
@@ -55,7 +39,7 @@ VkShaderModule createShaderModule(const std::vector<char>& shaderCode) {
 	return shaderModule;
 }
 
-bool createGraphicsPipelines(VkShaderModule vertShaderModule, VkShaderModule fragShaderModule) {
+VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule fragShaderModule) {
 	VkPipelineShaderStageCreateInfo vertPipelineShaderStageCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		.stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -134,18 +118,26 @@ bool createGraphicsPipelines(VkShaderModule vertShaderModule, VkShaderModule fra
 		.pDynamicStates = dynamicState.data()
 	};
 
-	VkPipelineLayout pipelineLayout;
-
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 0,
 		.pushConstantRangeCount = 0
 	};
 
-	if (vkCreatePipelineLayout(context.device, &pipelineLayoutCreateInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
+	if (vkCreatePipelineLayout(
+		context.device, &pipelineLayoutCreateInfo,
+		nullptr, &pipelineLayout
+	) != VK_SUCCESS) {
 		std::cerr << "Failed to create Vulkan pipeline layout\n";
-		return false;
+		return nullptr;
 	}
+
+	VkPipelineDepthStencilStateCreateInfo pipelineDepthStencilStateCreateInfo{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		.depthTestEnable = VK_TRUE,
+		.depthWriteEnable = VK_TRUE,
+		.depthCompareOp = VK_COMPARE_OP_LESS,
+	};
 
 	VkGraphicsPipelineCreateInfo graphicsPipelineCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -156,6 +148,7 @@ bool createGraphicsPipelines(VkShaderModule vertShaderModule, VkShaderModule fra
 		.pViewportState = &pipelineViewportStateCreateInfo,
 		.pRasterizationState = &pipelineRasterizationStateCreateInfo,
 		.pMultisampleState = &pipelineMultisampleStateCreateInfo,
+		.pDepthStencilState = &pipelineDepthStencilStateCreateInfo,
 		.pColorBlendState = &pipelineColorBlendStateCreateInfo,
 		.pDynamicState = &pipelineDynamicStateCreateInfo,
 		.layout = pipelineLayout,
@@ -164,16 +157,95 @@ bool createGraphicsPipelines(VkShaderModule vertShaderModule, VkShaderModule fra
 		.basePipelineHandle = VK_NULL_HANDLE
 	};
 
-	VkPipeline graphicPipeline;
+	
 
 	if (vkCreateGraphicsPipelines(
 		context.device, VK_NULL_HANDLE, 1,
 		&graphicsPipelineCreateInfo, nullptr, &graphicPipeline
 	) != VK_SUCCESS) {
-		std::cerr << "Failed to create Vulkan image view for depth buffer\n";
+		std::cerr << "Failed to create Vulkan graphic pipeline\n";
+		return nullptr;
+	}
+	return graphicPipeline;
+}
+
+namespace application {
+
+bool initialize() {
+	auto vertShaderCode = readFile("shaders/pyramid.vert.spv");
+	auto fragShaderCode = readFile("shaders/pyramid.frag.spv");
+
+	auto vertShaderModule = createShaderModule(vertShaderCode);
+	if (vertShaderModule == nullptr) {
+		vkDestroyShaderModule(context.device, vertShaderModule, nullptr);
+		return false;
+	}
+
+	auto fragShaderModule = createShaderModule(fragShaderCode);
+	if (fragShaderModule == nullptr) {
+		vkDestroyShaderModule(context.device, vertShaderModule, nullptr);
+		vkDestroyShaderModule(context.device, fragShaderModule, nullptr);
+		return false;
+	}
+
+	graphicPipeline = createGraphicPipeline(vertShaderModule, fragShaderModule);
+	vkDestroyShaderModule(context.device, vertShaderModule, nullptr);
+	vkDestroyShaderModule(context.device, fragShaderModule, nullptr);
+	if (graphicPipeline == nullptr) {
 		return false;
 	}
 	return true;
 }
 
+void shutdown() {
+	vkQueueWaitIdle(context.graphics_queue);
+	vkDestroyPipeline(context.device, graphicPipeline, nullptr);
+	vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
 }
+
+void update([[maybe_unused]] double time) {
+	ImGui::ShowDemoWindow();
+}
+
+void render(const graphics::internal::FrameData& fd) {
+    vkResetCommandBuffer(fd.command_buffer, 0);
+
+    const VkCommandBufferBeginInfo begin = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(fd.command_buffer, &begin);
+
+    const VkClearValue clears[2] = {
+        { .color = { { 0.1f, 0.1f, 0.1f, 1.0f } } },
+        { .depthStencil = { .depth = 1.0f, .stencil = 0 } },
+    };
+
+    const VkRenderPassBeginInfo rp = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = context.render_pass,
+        .framebuffer = fd.framebuffer,
+        .renderArea = { .extent = context.swapchain_extent },
+        .clearValueCount = 2,
+        .pClearValues = clears,
+    };
+    vkCmdBeginRenderPass(fd.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+    vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicPipeline);
+
+    const VkViewport viewport = {
+        0.0f, 0.0f,
+        float(context.swapchain_extent.width), float(context.swapchain_extent.height),
+        0.0f, 1.0f,
+    };
+    const VkRect2D scissor = { .offset = {0, 0}, .extent = context.swapchain_extent };
+    vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
+
+    vkCmdDraw(fd.command_buffer, 3, 1, 0, 0);
+
+    vkCmdEndRenderPass(fd.command_buffer);
+    vkEndCommandBuffer(fd.command_buffer);
+}
+
+} // namespace application
