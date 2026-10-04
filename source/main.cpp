@@ -1,5 +1,4 @@
 #include <cstdint>
-#include <climits>
 
 #include <iostream>
 
@@ -20,6 +19,26 @@ constexpr int32_t default_window_height = 720;
 constexpr char default_window_title[] = "Vulkan Starter App";
 
 GLFWwindow* glfw_window;
+
+bool loadUiFont() {
+	static constexpr const char* fontPath = "C:/Windows/Fonts/segoeui.ttf";
+	static constexpr float fontSize = 16.0f;
+
+	ImFontConfig fontConfig{};
+	fontConfig.OversampleH = 2;
+	fontConfig.OversampleV = 1;
+
+	ImFont* font = ImGui::GetIO().Fonts->AddFontFromFileTTF(
+		fontPath, fontSize, &fontConfig
+	);
+
+	if (font == nullptr) {
+		std::cerr << "Failed to load font: " << fontPath << '\n';
+		return false;
+	}
+
+	return true;
+}
 
 } // namespace
 
@@ -48,10 +67,16 @@ int main() {
 		graphics::internal::resize(width, height);
 	});
 
+	application::attachWindow(glfw_window);
+
 	if (ImGui::CreateContext() == nullptr) {
 		std::cerr << "Failed to create ImGUI context\n";
 		status = EXIT_FAILURE;
 		goto err_imgui_init;
+	}
+
+	if (!loadUiFont()) {
+		std::cerr << "Failed to load font, Cyrillic text may be unavailable\n";
 	}
 
 	if (!ImGui_ImplGlfw_InitForVulkan(glfw_window, true)) {

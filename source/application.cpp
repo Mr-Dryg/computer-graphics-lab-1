@@ -7,6 +7,9 @@
 #include <iostream>
 #include <cstring>
 
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
 #ifndef GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #endif
@@ -22,8 +25,6 @@ VmaAllocation vertexBufferAllocation;
 VkBuffer indexBuffer;
 VmaAllocation indexBufferAllocation;
 
-constexpr uint32_t vertexCount = 18;
-
 struct Vertex {
 	float position[3];
 };
@@ -34,14 +35,6 @@ constexpr glm::vec3 color_back = glm::vec3(0.36f, 0.72f, 0.42f);   // зелён
 constexpr glm::vec3 color_left = glm::vec3(0.24f, 0.68f, 0.76f);   // бирюзовый
 constexpr glm::vec3 color_bottom = glm::vec3(0.45f, 0.40f, 0.58f); // тёмно-фиолетовый
 
-// Вершины квадратной пирамиды.
-//
-//   0 = ( 0.5, -0.5,  0.5)  угол основания
-//   1 = ( 0.5, -0.5, -0.5)  угол основания
-//   2 = (-0.5, -0.5, -0.5)  угол основания
-//   3 = (-0.5, -0.5,  0.5)  угол основания
-//   4 = ( 0.0,  0.5,  0.0)  вершина
-//
 const std::vector<Vertex> vertices = {
 	{{ 0.5f, -0.5f,  0.5f}},   // 0
 	{{ 0.5f, -0.5f, -0.5f}},   // 1
@@ -74,9 +67,6 @@ const std::vector<uint16_t> indices = {
 	2, 3, 0,   // дно, вторая половина
 };
 
-constexpr uint32_t indexCount = 18;
-
-// Данные, передаваемые в шейдер через push constants.
 struct Transform {
 	glm::mat4 modelViewProjection;
 	glm::vec3 color;
@@ -91,6 +81,93 @@ constexpr glm::vec3 faceColors[6] = {
 	color_bottom,  // дно, 1-я половина
 	color_bottom,  // дно, 2-я половина
 };
+
+// Начальные значения трансформаций.
+constexpr glm::vec3 initialPosition{0.0f, 0.0f, 0.0f};
+constexpr glm::vec3 initialRotationDegrees{20.0f, 0.0f, 0.0f};
+constexpr glm::vec3 initialScale{1.0f, 1.0f, 1.0f};
+
+// Всё, чем можно управлять из интерфейса
+struct SceneState {
+	// Задание 1: проекция
+	bool perspective = true;
+	float fovDegrees = 45.0f;  // угол обзора по вертикали, градусы
+
+	// Задание 2: трансформации.
+	glm::vec3 position = initialPosition;
+	glm::vec3 rotationDegrees = initialRotationDegrees;  // наклон по X обязателен
+	glm::vec3 scale = initialScale;
+};
+
+SceneState state;
+
+namespace application {
+
+namespace {
+
+GLFWwindow* window = nullptr;
+
+bool mouseButtonHeld = false;
+double lastMouseX = 0.0;
+double lastMouseY = 0.0;
+
+// При 90° ось поворота совпадает с направлением взгляда и матрица
+// вырождается — объект переворачивается вверх ногами.
+constexpr float maxPitchDegrees = 89.0f;
+
+} // namespace
+
+void attachWindow(GLFWwindow* const glfwWindow) {
+	window = glfwWindow;
+
+	glfwSetMouseButtonCallback(window, [](GLFWwindow*, int button, int action, int) {
+		application::onMouseButton(button, action);
+	});
+
+	glfwSetCursorPosCallback(window, [](GLFWwindow*, double xpos, double ypos) {
+		application::onCursorPos(xpos, ypos);
+	});
+}
+
+void onMouseButton(int button, int action) {
+	if (button != GLFW_MOUSE_BUTTON_LEFT) {
+		return;
+	}
+
+	mouseButtonHeld = (action == GLFW_PRESS);
+
+	if (mouseButtonHeld && window != nullptr) {
+		glfwGetCursorPos(window, &lastMouseX, &lastMouseY);
+	}
+}
+
+void onCursorPos(double xpos, double ypos) {
+	if (!mouseButtonHeld) {
+		return;
+	}
+
+	if (ImGui::GetIO().WantCaptureMouse) {
+		lastMouseX = xpos;
+		lastMouseY = ypos;
+		return;
+	}
+
+	const double dx = xpos - lastMouseX;
+	const double dy = ypos - lastMouseY;
+
+	lastMouseX = xpos;
+	lastMouseY = ypos;
+
+	constexpr double mouseSensitivity = 0.3;
+	state.rotationDegrees.y += static_cast<float>(dx * mouseSensitivity);
+	state.rotationDegrees.x += static_cast<float>(dy * mouseSensitivity);
+
+	state.rotationDegrees.x = glm::clamp(
+		state.rotationDegrees.x, -maxPitchDegrees, maxPitchDegrees
+	);
+}
+
+} // namespace application
 
 std::vector<char> readFile(const std::string& path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -260,62 +337,57 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 	return graphicPipeline;
 }
 
-bool createVertexBuffer() {
-		const VkBufferCreateInfo bufferCreateInfo{
-			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-			.size = vertices.size() * sizeof(Vertex),
-			.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-			.sharingMode = VK_SHARING_MODE_EXCLUSIVE
-		};
-
-		const VmaAllocationCreateInfo allocationInfo{
-			.usage = VMA_MEMORY_USAGE_CPU_TO_GPU
-		};
-
-		if (vmaCreateBuffer(context.allocator, &bufferCreateInfo, &allocationInfo,
-							&vertexBuffer, &vertexBufferAllocation, nullptr) != VK_SUCCESS) {
-			std::cerr << "Failed to allocate and create vertex buffer\n";
-			return false;
-		}
-
-		void* mapped = nullptr;
-		if (vmaMapMemory(context.allocator, vertexBufferAllocation, &mapped) != VK_SUCCESS) {
-			std::cerr << "Failed to map vertex buffer memory\n";
-			return false;
-		}
-		std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(Vertex));
-		vmaUnmapMemory(context.allocator, vertexBufferAllocation);
-
-		return true;
-	}
-
-bool createIndexBuffer() {
-	const VkBufferCreateInfo bufferCreateInfo{
+bool createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                      const void* data, VkBuffer* buffer,
+                      VmaAllocation* allocation) {
+	const VkBufferCreateInfo bufferInfo{
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size = indices.size() * sizeof(uint16_t),
-		.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+		.size = size,
+		.usage = usage,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE
 	};
 
-	const VmaAllocationCreateInfo allocationInfo{
+	const VmaAllocationCreateInfo allocInfo{
 		.usage = VMA_MEMORY_USAGE_CPU_TO_GPU
 	};
 
-	if (vmaCreateBuffer(context.allocator, &bufferCreateInfo, &allocationInfo,
-						&indexBuffer, &indexBufferAllocation, nullptr) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate and create index buffer\n";
+	if (vmaCreateBuffer(context.allocator, &bufferInfo, &allocInfo,
+						buffer, allocation, nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate buffer\n";
 		return false;
 	}
 
 	void* mapped = nullptr;
-	if (vmaMapMemory(context.allocator, indexBufferAllocation, &mapped) != VK_SUCCESS) {
-		std::cerr << "Failed to map index buffer memory\n";
+	if (vmaMapMemory(context.allocator, *allocation, &mapped) != VK_SUCCESS) {
+		std::cerr << "Failed to map buffer memory\n";
 		return false;
 	}
-	std::memcpy(mapped, indices.data(), indices.size() * sizeof(uint16_t));
-	vmaUnmapMemory(context.allocator, indexBufferAllocation);
+
+	if (data != nullptr) {
+		std::memcpy(mapped, data, static_cast<size_t>(size));
+	}
+
+	vmaUnmapMemory(context.allocator, *allocation);
 
 	return true;
+}
+
+bool createVertexBuffer() {
+	return createHostBuffer(
+		vertices.size() * sizeof(Vertex),
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		vertices.data(),
+		&vertexBuffer, &vertexBufferAllocation
+	);
+}
+
+bool createIndexBuffer() {
+	return createHostBuffer(
+		indices.size() * sizeof(uint16_t),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+		indices.data(),
+		&indexBuffer, &indexBufferAllocation
+	);
 }
 
 namespace application {
@@ -362,11 +434,59 @@ void shutdown() {
 	vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
 }
 
+static void drawControlPanel() {
+	ImGui::Begin("Controls");
+
+	// Задание 1: переключение проекции
+	if (ImGui::Checkbox("Перспективная проекция", &state.perspective)) {
+	}
+
+	// Ползунок только для активной проекции: FOV в ортографическом режиме ни на что не влияет.
+	if (state.perspective) {
+		ImGui::SliderFloat("Угол обзора (FOV)", &state.fovDegrees, 15.0f, 90.0f, "%.0f deg");
+	}
+
+	ImGui::Separator();
+
+	// Задание 2: трансформации.
+	ImGui::TextUnformatted("Позиция");
+	ImGui::PushID("position");
+	ImGui::DragFloat("X", &state.position.x, 0.05f, -5.0f, 5.0f, "%.2f");
+	ImGui::DragFloat("Y", &state.position.y, 0.05f, -5.0f, 5.0f, "%.2f");
+	ImGui::DragFloat("Z", &state.position.z, 0.05f, -5.0f, 5.0f, "%.2f");
+	if (ImGui::Button("Сбросить")) {
+		state.position = initialPosition;
+	}
+	ImGui::PopID();
+
+	ImGui::TextUnformatted("Поворот (градусы)");
+	ImGui::PushID("rotation");
+	ImGui::DragFloat("X", &state.rotationDegrees.x, 0.5f, -360.0f, 360.0f, "%.0f");
+	ImGui::DragFloat("Y", &state.rotationDegrees.y, 0.5f, -360.0f, 360.0f, "%.0f");
+	ImGui::DragFloat("Z", &state.rotationDegrees.z, 0.5f, -360.0f, 360.0f, "%.0f");
+	if (ImGui::Button("Сбросить")) {
+		state.rotationDegrees = initialRotationDegrees;
+	}
+	ImGui::PopID();
+
+	ImGui::TextUnformatted("Растяжение");
+	ImGui::PushID("scale");
+	ImGui::DragFloat("X", &state.scale.x, 0.05f, 0.1f, 5.0f, "%.2f");
+	ImGui::DragFloat("Y", &state.scale.y, 0.05f, 0.1f, 5.0f, "%.2f");
+	ImGui::DragFloat("Z", &state.scale.z, 0.05f, 0.1f, 5.0f, "%.2f");
+	if (ImGui::Button("Сбросить")) {
+		state.scale = initialScale;
+	}
+	ImGui::PopID();
+
+	ImGui::End();
+}
+
 double currentTime = 0.0;
 
 void update(double time) {
 	currentTime = time;
-	ImGui::ShowDemoWindow();
+	drawControlPanel();
 }
 
 void render(const graphics::internal::FrameData& fd) {
@@ -408,37 +528,60 @@ void render(const graphics::internal::FrameData& fd) {
     vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer, &bufferOffset);
     vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-    // MVP: ортографическая проекция + поворот.
-    // В Vulkan ось Y направлена вниз, поэтому матрицу вида дополнительно
-    // отражае Y, инам поче изображение получится перевёрнутым.
+    // Задание 1: выбор проекции. perspective отвечает на вопрос «как видно
+    // через объектив», ortho — «как на чертеже». Обеим нужен aspect, иначе
+    // изображение растянется по горизонтали.
     const float aspect = float(context.swapchain_extent.width) /
                          float(context.swapchain_extent.height);
 
-    // Перспективная проекция: в отличие от ортографической, сохраняет
-    // различие глубин, поэтому объёмные грани становятся различимыми.
-    glm::mat4 projection = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
+    glm::mat4 projection;
+
+    if (state.perspective) {
+        projection = glm::perspective(
+            glm::radians(state.fovDegrees),
+            aspect,
+            0.1f,   // near
+            100.0f  // far
+        );
+    } else {
+		// Видимая область: от -1 до +1 по вертикали и по aspect по горизонтали.
+		// Масштаб в ортографии задаётся растяжением объекта, а не камерой.
+		projection = glm::ortho(
+			-aspect, aspect,
+			-1.0f, 1.0f,
+			0.1f,   // near
+            100.0f  // far
+		);
+    }
 
     glm::mat4 view = glm::lookAt(
-        glm::vec3(0.0f, 0.0f, 3.0f),
-        glm::vec3(0.0f, 0.0f, 0.0f),
-        glm::vec3(0.0f, 1.0f, 0.0f)
+        glm::vec3(0.0f, 0.0f, 3.0f),  // глаз
+        glm::vec3(0.0f, 0.0f, 0.0f),  // цель
+        glm::vec3(0.0f, 1.0f, 0.0f)   // верх
     );
-    view[1][1] *= -1.0f; // отражение по Y для Vulkan
+    // В Vulkan ось Y направлена вниз, в GLM — вверх. Отражение возвращает
+    // правильную ориентацию; попутно меняет winding, поэтому frontFace
+    // в пайплайне выставлен на CLOCKWISE с расчётом на это отражение.
+    view[1][1] *= -1.0f;
 
-    // Наклон вокруг X обязателен: без него пирамида повёрнута ровно
-    // осью к камере и выглядит плоской фигурой. Поворот вокруг Z
-    // лишь крутит силуэт в плоскости экрана и объёма не добавляет.
-    glm::mat4 model = glm::rotate(
-        glm::mat4(1.0f),
-        glm::radians(20.0f),
-        glm::vec3(1.0f, 0.0f, 0.0f)
-    );
-    model = glm::rotate(model, glm::radians(static_cast<float>(currentTime) * 30.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    // Задание 2: трансформации из интерфейса.
+    //
+    // Порядок умножения: GLM хранит матрицы column-major, и M * v применяет
+    // сначала M, потом v. Поэтому цепочка идёт от последнего преобразования
+    // к первому — scale, затем rotate, затем translate. Перестановка
+    // translate и scale применит масштабирование к координате сдвига.
+    glm::mat4 model = glm::mat4(1.0f);
+
+    model = glm::scale(model, state.scale);
+    model = glm::rotate(model, glm::radians(state.rotationDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f));
+    model = glm::rotate(model, glm::radians(state.rotationDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f));
+    model = glm::rotate(model, glm::radians(state.rotationDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
+    model = glm::translate(model, state.position);
+
     glm::mat4 transform = projection * view * model;
 
-    // Рисуем каждый треугольник отдельным вызовом: цвет грани передаётся
-    // через push constants, а вершины у соседних граней общие, поэтому
-    // одним вызовом vkCmdDrawIndexed обойтись нельзя.
+    // Цвет передаётся на каждую грань отдельно, а вершины у соседних граней
+    // общие — одним вызовом vkCmdDrawIndexed обойтись нельзя.
     constexpr uint32_t indicesPerTriangle = 3;
 
     for (uint32_t i = 0; i < 6; ++i) {
