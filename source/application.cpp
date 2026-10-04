@@ -5,10 +5,92 @@
 #include <fstream>
 #include <vector>
 #include <iostream>
+#include <cstring>
+
+#ifndef GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#endif
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 auto& context = graphics::internal::context;
 VkPipeline graphicPipeline;
 VkPipelineLayout pipelineLayout;
+
+VkBuffer vertexBuffer;
+VmaAllocation vertexBufferAllocation;
+VkBuffer indexBuffer;
+VmaAllocation indexBufferAllocation;
+
+constexpr uint32_t vertexCount = 18;
+
+struct Vertex {
+	float position[3];
+};
+
+constexpr glm::vec3 color_front = glm::vec3(0.90f, 0.32f, 0.26f);  // коралловый
+constexpr glm::vec3 color_right = glm::vec3(0.95f, 0.62f, 0.20f);  // янтарный
+constexpr glm::vec3 color_back = glm::vec3(0.36f, 0.72f, 0.42f);   // зелёный
+constexpr glm::vec3 color_left = glm::vec3(0.24f, 0.68f, 0.76f);   // бирюзовый
+constexpr glm::vec3 color_bottom = glm::vec3(0.45f, 0.40f, 0.58f); // тёмно-фиолетовый
+
+// Вершины квадратной пирамиды.
+//
+//   0 = ( 0.5, -0.5,  0.5)  угол основания
+//   1 = ( 0.5, -0.5, -0.5)  угол основания
+//   2 = (-0.5, -0.5, -0.5)  угол основания
+//   3 = (-0.5, -0.5,  0.5)  угол основания
+//   4 = ( 0.0,  0.5,  0.0)  вершина
+//
+const std::vector<Vertex> vertices = {
+	{{ 0.5f, -0.5f,  0.5f}},   // 0
+	{{ 0.5f, -0.5f, -0.5f}},   // 1
+	{{-0.5f, -0.5f, -0.5f}},   // 2
+	{{-0.5f, -0.5f,  0.5f}},   // 3
+	{{ 0.0f,  0.5f,  0.0f}},   // 4 — вершина
+};
+
+const VkVertexInputBindingDescription bindingDescription = {
+	.binding = 0,
+	.stride = sizeof(Vertex),
+	.inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+};
+
+const VkVertexInputAttributeDescription attributeDescriptions[] = {
+	{
+		.location = 0,
+		.binding = 0,
+		.format = VK_FORMAT_R32G32B32_SFLOAT,
+		.offset = offsetof(Vertex, position)
+	},
+};
+
+const std::vector<uint16_t> indices = {
+	4, 0, 3,   // передняя грань
+	4, 1, 0,   // правая грань
+	4, 2, 1,   // задняя грань
+	4, 3, 2,   // левая грань
+	1, 2, 0,   // дно, первая половина
+	2, 3, 0,   // дно, вторая половина
+};
+
+constexpr uint32_t indexCount = 18;
+
+// Данные, передаваемые в шейдер через push constants.
+struct Transform {
+	glm::mat4 modelViewProjection;
+	glm::vec3 color;
+};
+static_assert(sizeof(Transform) == 76, "раскладка push constants разошлась с шейдером");
+
+constexpr glm::vec3 faceColors[6] = {
+	color_front,   // передняя
+	color_right,   // правая
+	color_back,    // задняя
+	color_left,    // левая
+	color_bottom,  // дно, 1-я половина
+	color_bottom,  // дно, 2-я половина
+};
 
 std::vector<char> readFile(const std::string& path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
@@ -61,8 +143,10 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 
 	VkPipelineVertexInputStateCreateInfo pipelineVertexInputStateCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-		.vertexBindingDescriptionCount = 0,
-		.vertexAttributeDescriptionCount = 0
+		.vertexBindingDescriptionCount = 1,
+		.pVertexBindingDescriptions = &bindingDescription,
+		.vertexAttributeDescriptionCount = 1,
+		.pVertexAttributeDescriptions = attributeDescriptions
 	};
 
 	VkPipelineInputAssemblyStateCreateInfo pipelineInputAssemblyStateCreateInfo{
@@ -118,10 +202,17 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 		.pDynamicStates = dynamicState.data()
 	};
 
+	VkPushConstantRange pushConstantRange{};
+	pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+	pushConstantRange.offset = 0;
+	pushConstantRange.size = sizeof(Transform);
+
 	VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = 0,
-		.pushConstantRangeCount = 0
+		.pSetLayouts = nullptr,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &pushConstantRange
 	};
 
 	if (vkCreatePipelineLayout(
@@ -169,9 +260,75 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 	return graphicPipeline;
 }
 
+bool createVertexBuffer() {
+		const VkBufferCreateInfo bufferCreateInfo{
+			.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+			.size = vertices.size() * sizeof(Vertex),
+			.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+			.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+		};
+
+		const VmaAllocationCreateInfo allocationInfo{
+			.usage = VMA_MEMORY_USAGE_CPU_TO_GPU
+		};
+
+		if (vmaCreateBuffer(context.allocator, &bufferCreateInfo, &allocationInfo,
+							&vertexBuffer, &vertexBufferAllocation, nullptr) != VK_SUCCESS) {
+			std::cerr << "Failed to allocate and create vertex buffer\n";
+			return false;
+		}
+
+		void* mapped = nullptr;
+		if (vmaMapMemory(context.allocator, vertexBufferAllocation, &mapped) != VK_SUCCESS) {
+			std::cerr << "Failed to map vertex buffer memory\n";
+			return false;
+		}
+		std::memcpy(mapped, vertices.data(), vertices.size() * sizeof(Vertex));
+		vmaUnmapMemory(context.allocator, vertexBufferAllocation);
+
+		return true;
+	}
+
+bool createIndexBuffer() {
+	const VkBufferCreateInfo bufferCreateInfo{
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = indices.size() * sizeof(uint16_t),
+		.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+	};
+
+	const VmaAllocationCreateInfo allocationInfo{
+		.usage = VMA_MEMORY_USAGE_CPU_TO_GPU
+	};
+
+	if (vmaCreateBuffer(context.allocator, &bufferCreateInfo, &allocationInfo,
+						&indexBuffer, &indexBufferAllocation, nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate and create index buffer\n";
+		return false;
+	}
+
+	void* mapped = nullptr;
+	if (vmaMapMemory(context.allocator, indexBufferAllocation, &mapped) != VK_SUCCESS) {
+		std::cerr << "Failed to map index buffer memory\n";
+		return false;
+	}
+	std::memcpy(mapped, indices.data(), indices.size() * sizeof(uint16_t));
+	vmaUnmapMemory(context.allocator, indexBufferAllocation);
+
+	return true;
+}
+
 namespace application {
 
 bool initialize() {
+	if (!createVertexBuffer()) {
+		return false;
+	}
+
+	if (!createIndexBuffer()) {
+		return false;
+	}
+
 	auto vertShaderCode = readFile("shaders/pyramid.vert.spv");
 	auto fragShaderCode = readFile("shaders/pyramid.frag.spv");
 
@@ -199,11 +356,16 @@ bool initialize() {
 
 void shutdown() {
 	vkQueueWaitIdle(context.graphics_queue);
+	vmaDestroyBuffer(context.allocator, vertexBuffer, vertexBufferAllocation);
+	vmaDestroyBuffer(context.allocator, indexBuffer, indexBufferAllocation);
 	vkDestroyPipeline(context.device, graphicPipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
 }
 
-void update([[maybe_unused]] double time) {
+double currentTime = 0.0;
+
+void update(double time) {
+	currentTime = time;
 	ImGui::ShowDemoWindow();
 }
 
@@ -242,7 +404,57 @@ void render(const graphics::internal::FrameData& fd) {
     vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
     vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-    vkCmdDraw(fd.command_buffer, 3, 1, 0, 0);
+    const VkDeviceSize bufferOffset = 0;
+    vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer, &bufferOffset);
+    vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+    // MVP: ортографическая проекция + поворот.
+    // В Vulkan ось Y направлена вниз, поэтому матрицу вида дополнительно
+    // отражае Y, инам поче изображение получится перевёрнутым.
+    const float aspect = float(context.swapchain_extent.width) /
+                         float(context.swapchain_extent.height);
+
+    // Перспективная проекция: в отличие от ортографической, сохраняет
+    // различие глубин, поэтому объёмные грани становятся различимыми.
+    glm::mat4 projection = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
+
+    glm::mat4 view = glm::lookAt(
+        glm::vec3(0.0f, 0.0f, 3.0f),
+        glm::vec3(0.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f)
+    );
+    view[1][1] *= -1.0f; // отражение по Y для Vulkan
+
+    // Наклон вокруг X обязателен: без него пирамида повёрнута ровно
+    // осью к камере и выглядит плоской фигурой. Поворот вокруг Z
+    // лишь крутит силуэт в плоскости экрана и объёма не добавляет.
+    glm::mat4 model = glm::rotate(
+        glm::mat4(1.0f),
+        glm::radians(20.0f),
+        glm::vec3(1.0f, 0.0f, 0.0f)
+    );
+    model = glm::rotate(model, glm::radians(static_cast<float>(currentTime) * 30.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat4 transform = projection * view * model;
+
+    // Рисуем каждый треугольник отдельным вызовом: цвет грани передаётся
+    // через push constants, а вершины у соседних граней общие, поэтому
+    // одним вызовом vkCmdDrawIndexed обойтись нельзя.
+    constexpr uint32_t indicesPerTriangle = 3;
+
+    for (uint32_t i = 0; i < 6; ++i) {
+        const uint32_t offset = 3 * i;
+
+        const Transform pcData{
+            .modelViewProjection = transform,
+            .color = faceColors[i],
+        };
+
+        vkCmdPushConstants(fd.command_buffer, pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(Transform), &pcData);
+
+        vkCmdDrawIndexed(fd.command_buffer, indicesPerTriangle, 1, offset, 0, 0);
+    }
 
     vkCmdEndRenderPass(fd.command_buffer);
     vkEndCommandBuffer(fd.command_buffer);
