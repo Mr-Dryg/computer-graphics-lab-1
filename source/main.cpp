@@ -7,6 +7,7 @@
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
 
 #include "graphics_internal.hpp"
 #include "application.hpp"
@@ -101,6 +102,7 @@ int main() {
 		const double time = glfwGetTime();
 
 		glfwPollEvents();
+		ImGui_ImplVulkan_NewFrame();
 		ImGui_ImplGlfw_NewFrame();
 
 		ImGui::NewFrame();
@@ -124,5 +126,5 @@ err_imgui_init:
 err_null_window:
 	glfwTerminate();
 
-	return 0;
+	return status;
 }
