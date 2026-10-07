@@ -2,10 +2,12 @@
 #include "vulkan/vulkan_core.h"
 
 #include <imgui.h>
+#include <algorithm>
 #include <fstream>
 #include <vector>
 #include <iostream>
 #include <cstring>
+#include <numbers>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -25,23 +27,50 @@ VmaAllocation vertexBufferAllocation;
 VkBuffer indexBuffer;
 VmaAllocation indexBufferAllocation;
 
+// Раскладка вершинного буфера; должна совпадать с attributeDescriptions
+// и входами вершинного шейдера.
 struct Vertex {
 	float position[3];
+	float color[3];
 };
 
-constexpr glm::vec3 color_front = glm::vec3(0.90f, 0.32f, 0.26f);  // коралловый
-constexpr glm::vec3 color_right = glm::vec3(0.95f, 0.62f, 0.20f);  // янтарный
-constexpr glm::vec3 color_back = glm::vec3(0.36f, 0.72f, 0.42f);   // зелёный
-constexpr glm::vec3 color_left = glm::vec3(0.24f, 0.68f, 0.76f);   // бирюзовый
-constexpr glm::vec3 color_bottom = glm::vec3(0.45f, 0.40f, 0.58f); // тёмно-фиолетовый
+// Процедурный цвет вершины из её локальной позиции: по горизонтали —
+// градиент от красного к синему, по вертикали — чем выше, тем светлее.
+glm::vec3 proceduralVertexColor(const glm::vec3& localPosition) {
+	const float height = localPosition.y + 0.5f;  // 0..1 внутри фигуры
 
-const std::vector<Vertex> vertices = {
-	{{ 0.5f, -0.5f,  0.5f}},   // 0
-	{{ 0.5f, -0.5f, -0.5f}},   // 1
-	{{-0.5f, -0.5f, -0.5f}},   // 2
-	{{-0.5f, -0.5f,  0.5f}},   // 3
-	{{ 0.0f,  0.5f,  0.0f}},   // 4 — вершина
+	return {
+		1.0f - localPosition.x,
+		0.5f + 0.5f * height,
+		localPosition.x + 0.5f
+	};
+}
+
+// Позиции вершин пирамиды в локальной системе координат.
+constexpr glm::vec3 vertexPositions[5] = {
+	{ 0.5f, -0.5f,  0.5f},   // 0
+	{ 0.5f, -0.5f, -0.5f},   // 1
+	{-0.5f, -0.5f, -0.5f},   // 2
+	{-0.5f, -0.5f,  0.5f},   // 3
+	{ 0.0f,  0.5f,  0.0f},   // 4 — вершина
 };
+
+// Цвет каждой вершины считается процедурно из её локальной позиции.
+const std::vector<Vertex> vertices = [] {
+	std::vector<Vertex> result;
+	result.reserve(std::size(vertexPositions));
+
+	for (const glm::vec3& position : vertexPositions) {
+		const glm::vec3 color = proceduralVertexColor(position);
+
+		result.push_back(Vertex{
+			{position.x, position.y, position.z},
+			{color.r, color.g, color.b}
+		});
+	}
+
+	return result;
+}();
 
 const VkVertexInputBindingDescription bindingDescription = {
 	.binding = 0,
@@ -56,6 +85,12 @@ const VkVertexInputAttributeDescription attributeDescriptions[] = {
 		.format = VK_FORMAT_R32G32B32_SFLOAT,
 		.offset = offsetof(Vertex, position)
 	},
+	{
+		.location = 1,
+		.binding = 0,
+		.format = VK_FORMAT_R32G32B32_SFLOAT,
+		.offset = offsetof(Vertex, color)
+	},
 };
 
 const std::vector<uint16_t> indices = {
@@ -67,39 +102,86 @@ const std::vector<uint16_t> indices = {
 	2, 3, 0,   // дно, вторая половина
 };
 
+// Данные, передаваемые в шейдеры через push constants каждый кадр.
 struct Transform {
 	glm::mat4 modelViewProjection;
 	glm::vec3 color;
 };
 static_assert(sizeof(Transform) == 76, "раскладка push constants разошлась с шейдером");
 
-constexpr glm::vec3 faceColors[6] = {
-	color_front,   // передняя
-	color_right,   // правая
-	color_back,    // задняя
-	color_left,    // левая
-	color_bottom,  // дно, 1-я половина
-	color_bottom,  // дно, 2-я половина
-};
-
 // Начальные значения трансформаций.
 constexpr glm::vec3 initialPosition{0.0f, 0.0f, 0.0f};
-constexpr glm::vec3 initialRotationDegrees{20.0f, 0.0f, 0.0f};
+constexpr glm::vec3 initialRotationDegrees{0.0f, 0.0f, 0.0f};
 constexpr glm::vec3 initialScale{1.0f, 1.0f, 1.0f};
 
-// Всё, чем можно управлять из интерфейса
-struct SceneState {
-	// Задание 1: проекция
-	bool perspective = true;
-	float fovDegrees = 45.0f;  // угол обзора по вертикали, градусы
+constexpr float pi = static_cast<float>(std::numbers::pi);
 
-	// Задание 2: трансформации.
+// Геометрия спирали и границы ползунков. Высота задана константой: ползунок
+// радиуса меняет только круг по XZ, а кадр считается по максимумам, поэтому
+// камера не «прыгает» при изменении ползунков.
+constexpr float spiralHalfHeight = 5.0f;      // полуразмах спирали по Y
+constexpr float fovDegrees = 45.0f;           // угол обзора по вертикали
+constexpr float maxOrbitRadius = 5.0f;        // верхняя граница ползунка радиуса
+constexpr float minSpiralTurns = 0.5f;        // нижняя граница ползунка витков
+constexpr float cameraObjectAllowance = 0.8f; // запас кадра на габарит пирамиды
+constexpr float framePadding = 1.05f;         // доля кадра, занимаемая сценой
+
+struct SceneState {
+	// Проекция
+	bool perspective = true;
+
+	// Трансформации.
 	glm::vec3 position = initialPosition;
-	glm::vec3 rotationDegrees = initialRotationDegrees;  // наклон по X обязателен
+	glm::vec3 rotationDegrees = initialRotationDegrees;  // доводка поверх автоориентации
 	glm::vec3 scale = initialScale;
+
+	// Траектория.
+	bool animationPaused = false;
+	float animationTime = 0.0f;
+	float animationSpeed = 1.0f;
+	float orbitRadius = 1.5f;
+	float spiralTurns = 2.0f;
+
+	// Цвет-множитель, умножается на процедурный цвет вершины
+	// во фрагментном шейдере. Белый оставляет исходные цвета.
+	glm::vec3 tint = glm::vec3(1.0f);
 };
 
 SceneState state;
+
+// Точка траектории для прогресса p в диапазоне [0, 1].
+glm::vec3 trajectoryPoint(float progress) {
+	const float angle = progress * 2.0f * pi * state.spiralTurns;
+
+	return {
+		std::cos(angle) * state.orbitRadius,
+		std::sin(progress * pi) * spiralHalfHeight,
+		std::sin(angle) * state.orbitRadius,
+	};
+}
+
+// Касательная к траектории — производная точки по прогрессу, без нормировки.
+glm::vec3 trajectoryTangent(float progress) {
+	const float angle = progress * 2.0f * pi * state.spiralTurns;
+	const float angularSpeed = 2.0f * pi * state.spiralTurns;
+
+	return {
+		-std::sin(angle) * state.orbitRadius * angularSpeed,
+		std::cos(progress * pi) * pi * spiralHalfHeight,
+		std::cos(angle) * state.orbitRadius * angularSpeed,
+	};
+}
+
+// За цикл пирамида обходит окружность радиуса orbitRadius ровно spiralTurns
+// раз, поэтому длина пути по XZ постоянна и равна 2*pi*r*turns. Делим
+// скорость из ползунка на эту длину — и физическая скорость перестаёт
+// зависеть от радиуса и числа витков.
+float cycleDuration() {
+	const float pathLength = 2.0f * pi * state.orbitRadius * state.spiralTurns;
+	const float speed = std::max(state.animationSpeed, 0.01f);
+
+	return std::max(pathLength / speed, 0.05f);
+}
 
 namespace application {
 
@@ -117,6 +199,7 @@ constexpr float maxPitchDegrees = 89.0f;
 
 } // namespace
 
+// Запоминаем окно и подписываемся на события мыши для вращения камеры.
 void attachWindow(GLFWwindow* const glfwWindow) {
 	window = glfwWindow;
 
@@ -129,6 +212,7 @@ void attachWindow(GLFWwindow* const glfwWindow) {
 	});
 }
 
+// Вращение по зажатой левой кнопке мыши.
 void onMouseButton(int button, int action) {
 	if (button != GLFW_MOUSE_BUTTON_LEFT) {
 		return;
@@ -141,6 +225,9 @@ void onMouseButton(int button, int action) {
 	}
 }
 
+// Перетаскивание курсора превращается в поворот фигуры. Пока курсор над
+// интерфейсом ImGui, вращение не выполняется, но позиция запоминается,
+// чтобы при возврате на сцену не было скачка.
 void onCursorPos(double xpos, double ypos) {
 	if (!mouseButtonHeld) {
 		return;
@@ -169,6 +256,7 @@ void onCursorPos(double xpos, double ypos) {
 
 } // namespace application
 
+// Чтение бинарного файла целиком (для скомпилированных шейдеров).
 std::vector<char> readFile(const std::string& path) {
 	std::ifstream file(path, std::ios::ate | std::ios::binary);
 	size_t fileSize = static_cast<size_t>(file.tellg());
@@ -222,7 +310,7 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount = 1,
 		.pVertexBindingDescriptions = &bindingDescription,
-		.vertexAttributeDescriptionCount = 1,
+		.vertexAttributeDescriptionCount = 2,
 		.pVertexAttributeDescriptions = attributeDescriptions
 	};
 
@@ -337,6 +425,8 @@ VkPipeline createGraphicPipeline(VkShaderModule vertShaderModule, VkShaderModule
 	return graphicPipeline;
 }
 
+// Создание буфера, доступного из CPU: память выделяется VMA, данные
+// копируются в отображённую память и отображение снимается.
 bool createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                       const void* data, VkBuffer* buffer,
                       VmaAllocation* allocation) {
@@ -434,21 +524,19 @@ void shutdown() {
 	vkDestroyPipelineLayout(context.device, pipelineLayout, nullptr);
 }
 
+// Истинно, пока пользователь тянет ползунок таймлайна: на время перетаскивания
+// автопрокрутка ставится на паузу, чтобы ползунок не «убегал» из-под курсора.
+static bool timelineDragging = false;
+
+// Панель управления ImGui
 static void drawControlPanel() {
 	ImGui::Begin("Controls");
 
-	// Задание 1: переключение проекции
 	if (ImGui::Checkbox("Перспективная проекция", &state.perspective)) {
-	}
-
-	// Ползунок только для активной проекции: FOV в ортографическом режиме ни на что не влияет.
-	if (state.perspective) {
-		ImGui::SliderFloat("Угол обзора (FOV)", &state.fovDegrees, 15.0f, 90.0f, "%.0f deg");
 	}
 
 	ImGui::Separator();
 
-	// Задание 2: трансформации.
 	ImGui::TextUnformatted("Позиция");
 	ImGui::PushID("position");
 	ImGui::DragFloat("X", &state.position.x, 0.05f, -5.0f, 5.0f, "%.2f");
@@ -479,128 +567,237 @@ static void drawControlPanel() {
 	}
 	ImGui::PopID();
 
+	ImGui::Separator();
+	ImGui::TextUnformatted("Траектория");
+	if (ImGui::Button(state.animationPaused ? "Продолжить" : "Пауза")) {
+		state.animationPaused = !state.animationPaused;
+	}
+	ImGui::SameLine();
+	if (ImGui::Button("Сброс анимации")) {
+		state.animationTime = 0.0f;
+		state.animationPaused = false;
+	}
+	// Шкала таймлайна равна длительности цикла и перестраивается вместе с ней.
+	ImGui::SliderFloat("Таймлайн", &state.animationTime, 0.0f, cycleDuration(), "%.2f s");
+	if (ImGui::IsItemActive()) {
+		state.animationPaused = true;
+		timelineDragging = true;
+	} else if (timelineDragging) {
+		timelineDragging = false;
+	}
+	ImGui::SliderFloat("Скорость", &state.animationSpeed, 0.1f, 5.0f, "%.2fx");
+	ImGui::SliderFloat("Радиус спирали", &state.orbitRadius, 0.2f, maxOrbitRadius, "%.2f");
+	ImGui::SliderFloat("Плотность витков", &state.spiralTurns, minSpiralTurns, 6.0f, "%.1f");
+
+	ImGui::Separator();
+	ImGui::TextUnformatted("Цвет");
+	// Множитель на процедурные цвета вершин, а не самостоятельный цвет.
+	ImGui::ColorEdit3("Оттенок", &state.tint.x, ImGuiColorEditFlags_NoInputs);
+	ImGui::SameLine();
+	if (ImGui::Button("Сбросить")) {
+		state.tint = glm::vec3(1.0f);
+	}
+
 	ImGui::End();
 }
 
-double currentTime = 0.0;
+static double previousUpdateTime = 0.0;
+static bool hasPreviousUpdateTime = false;
 
 void update(double time) {
-	currentTime = time;
+	if (!hasPreviousUpdateTime) {
+		hasPreviousUpdateTime = true;
+		previousUpdateTime = time;
+	}
+
+	const double deltaTime = time - previousUpdateTime;
+	previousUpdateTime = time;
+
+	// Время идёт равномерно, а пройденное расстояние = время * скорость.
+	// Поэтому скорость в единицах в секунду задаётся исключительно ползунком.
+	if (!state.animationPaused) {
+		state.animationTime += static_cast<float>(deltaTime);
+	}
+
+	// После смены скорости или параметров траектории длительность цикла
+	// меняется, и время может выйти за её новые границы.
+	const float duration = cycleDuration();
+	state.animationTime -= std::floor(state.animationTime / duration) * duration;
+	state.animationTime = std::clamp(state.animationTime, 0.0f, duration);
+
 	drawControlPanel();
 }
 
 void render(const graphics::internal::FrameData& fd) {
-    vkResetCommandBuffer(fd.command_buffer, 0);
+	vkResetCommandBuffer(fd.command_buffer, 0);
 
-    const VkCommandBufferBeginInfo begin = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    vkBeginCommandBuffer(fd.command_buffer, &begin);
+	const VkCommandBufferBeginInfo begin = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vkBeginCommandBuffer(fd.command_buffer, &begin);
 
-    const VkClearValue clears[2] = {
-        { .color = { { 0.1f, 0.1f, 0.1f, 1.0f } } },
-        { .depthStencil = { .depth = 1.0f, .stencil = 0 } },
-    };
+	const VkClearValue clears[2] = {
+		{ .color = { { 0.1f, 0.1f, 0.1f, 1.0f } } },
+		{ .depthStencil = { .depth = 1.0f, .stencil = 0 } },
+	};
 
-    const VkRenderPassBeginInfo rp = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = context.render_pass,
-        .framebuffer = fd.framebuffer,
-        .renderArea = { .extent = context.swapchain_extent },
-        .clearValueCount = 2,
-        .pClearValues = clears,
-    };
-    vkCmdBeginRenderPass(fd.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+	const VkRenderPassBeginInfo rp = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass = context.render_pass,
+		.framebuffer = fd.framebuffer,
+		.renderArea = { .extent = context.swapchain_extent },
+		.clearValueCount = 2,
+		.pClearValues = clears,
+	};
+	vkCmdBeginRenderPass(fd.command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicPipeline);
+	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicPipeline);
 
-    const VkViewport viewport = {
-        0.0f, 0.0f,
-        float(context.swapchain_extent.width), float(context.swapchain_extent.height),
-        0.0f, 1.0f,
-    };
-    const VkRect2D scissor = { .offset = {0, 0}, .extent = context.swapchain_extent };
-    vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
+	const VkViewport viewport = {
+		0.0f, 0.0f,
+		float(context.swapchain_extent.width), float(context.swapchain_extent.height),
+		0.0f, 1.0f,
+	};
+	const VkRect2D scissor = { .offset = {0, 0}, .extent = context.swapchain_extent };
+	vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
+	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-    const VkDeviceSize bufferOffset = 0;
-    vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer, &bufferOffset);
-    vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+	const VkDeviceSize bufferOffset = 0;
+	vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertexBuffer, &bufferOffset);
+	vkCmdBindIndexBuffer(fd.command_buffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
-    // Задание 1: выбор проекции. perspective отвечает на вопрос «как видно
-    // через объектив», ortho — «как на чертеже». Обеим нужен aspect, иначе
-    // изображение растянется по горизонтали.
-    const float aspect = float(context.swapchain_extent.width) /
-                         float(context.swapchain_extent.height);
+	// Задание 1: выбор проекции. perspective отвечает на вопрос «как видно
+	// через объектив», ortho — «как на чертеже». Обеим нужен aspect, иначе
+	// изображение растянется по горизонтали.
+	const float aspect = float(context.swapchain_extent.width) /
+	                     float(context.swapchain_extent.height);
 
-    glm::mat4 projection;
+	// Габарит спирали: полуразмах по Y и радиус по XZ, плюс запас на пирамиду.
+	// Высота по Y постоянна, ширина берётся по максимуму ползунка радиуса,
+	// поэтому кадр не зависит от текущего значения ползунка.
+	const float frameHalfHeight = spiralHalfHeight + cameraObjectAllowance;
+	const float frameHalfWidth = maxOrbitRadius + cameraObjectAllowance;
 
-    if (state.perspective) {
-        projection = glm::perspective(
-            glm::radians(state.fovDegrees),
-            aspect,
-            0.1f,   // near
-            100.0f  // far
-        );
-    } else {
-		// Видимая область: от -1 до +1 по вертикали и по aspect по горизонтали.
-		// Масштаб в ортографии задаётся растяжением объекта, а не камерой.
-		projection = glm::ortho(
-			-aspect, aspect,
-			-1.0f, 1.0f,
-			0.1f,   // near
-            100.0f  // far
+	// Для точки (x, y, z) при камере на расстоянии d по оси Z условие попадания
+	// в перспективный кадр: |y| <= tan(halfFov) * (d - z). Худший случай по
+	// вертикали и горизонтали даёт две нижние границы для d, берём большую.
+	const float fovRadians = glm::radians(fovDegrees);
+	const float tanVertical = std::tan(fovRadians * 0.5f);
+	const float tanHorizontal = tanVertical * aspect;
+
+	const float distanceForVertical =
+		maxOrbitRadius + frameHalfHeight / tanVertical;
+	const float distanceForHorizontal =
+		maxOrbitRadius + frameHalfWidth / tanHorizontal;
+
+	const float distance =
+		framePadding * std::max(distanceForVertical, distanceForHorizontal);
+	const float farPlane = distance + frameHalfHeight + 1.0f;
+
+	glm::mat4 projection;
+
+	if (state.perspective) {
+		projection = glm::perspective(
+			fovRadians,
+			aspect,
+			0.1f,      // near
+			farPlane   // far
 		);
-    }
+	} else {
+		// В ортографии размер кадра не зависит от расстояния, поэтому
+		// расширяем саму видимую область до габарита анимации.
+		projection = glm::ortho(
+			-frameHalfWidth, frameHalfWidth,
+			-frameHalfHeight, frameHalfHeight,
+			0.1f,      // near
+			farPlane   // far
+		);
+	}
 
-    glm::mat4 view = glm::lookAt(
-        glm::vec3(0.0f, 0.0f, 3.0f),  // глаз
-        glm::vec3(0.0f, 0.0f, 0.0f),  // цель
-        glm::vec3(0.0f, 1.0f, 0.0f)   // верх
-    );
-    // В Vulkan ось Y направлена вниз, в GLM — вверх. Отражение возвращает
-    // правильную ориентацию; попутно меняет winding, поэтому frontFace
-    // в пайплайне выставлен на CLOCKWISE с расчётом на это отражение.
-    view[1][1] *= -1.0f;
+	glm::mat4 view = glm::lookAt(
+		glm::vec3(0.0f, 0.0f, distance),  // глаз
+		glm::vec3(0.0f, 0.0f, 0.0f),      // цель
+		glm::vec3(0.0f, 1.0f, 0.0f)       // верх
+	);
+	// В Vulkan ось Y направлена вниз, в GLM — вверх. Отражение возвращает
+	// правильную ориентацию; попутно меняет winding, поэтому frontFace
+	// в пайплайне выставлен на CLOCKWISE с расчётом на это отражение.
+	view[1][1] *= -1.0f;
 
-    // Задание 2: трансформации из интерфейса.
-    //
-    // Порядок умножения: GLM хранит матрицы column-major, и M * v применяет
-    // сначала M, потом v. Поэтому цепочка идёт от последнего преобразования
-    // к первому — scale, затем rotate, затем translate. Перестановка
-    // translate и scale применит масштабирование к координате сдвига.
-    glm::mat4 model = glm::mat4(1.0f);
+	// Параметр траектории идёт от времени через длительность цикла, а она уже
+	// учитывает скорость из ползунка. Радиус и число витков меняют форму пути
+	// и длительность цикла, но не скорость движения.
+	const float helixProgress = state.animationTime / cycleDuration();
 
-    model = glm::scale(model, state.scale);
-    model = glm::rotate(model, glm::radians(state.rotationDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(state.rotationDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f));
-    model = glm::rotate(model, glm::radians(state.rotationDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
-    model = glm::translate(model, state.position);
+	const glm::vec3 orbitOffset = trajectoryPoint(helixProgress);
 
-    glm::mat4 transform = projection * view * model;
+	const glm::vec3 objectPosition = state.position + orbitOffset;
 
-    // Цвет передаётся на каждую грань отдельно, а вершины у соседних граней
-    // общие — одним вызовом vkCmdDrawIndexed обойтись нельзя.
-    constexpr uint32_t indicesPerTriangle = 3;
+	// Касательная — направление движения: вершина пирамиды смотрит вдоль неё.
+	const glm::vec3 tangent = glm::normalize(trajectoryTangent(helixProgress));
 
-    for (uint32_t i = 0; i < 6; ++i) {
-        const uint32_t offset = 3 * i;
+	// Горизонтальное направление от пирамиды к оси спирали. Ось вертикальна
+	// и проходит через базовую позицию, поэтому достаточно обнулить Y.
+	glm::vec3 inward = glm::vec3(
+		state.position.x - objectPosition.x,
+		0.0f,
+		state.position.z - objectPosition.z
+	);
 
-        const Transform pcData{
-            .modelViewProjection = transform,
-            .color = faceColors[i],
-        };
+	if (glm::dot(inward, inward) < 1e-8f) {
+		inward = glm::vec3(0.0f, 0.0f, -1.0f);
+	} else {
+		inward = glm::normalize(inward);
+	}
 
-        vkCmdPushConstants(fd.command_buffer, pipelineLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(Transform), &pcData);
+	// Касательная всегда перпендикулярна радиальному направлению: её
+	// горизонтальная составляющая направлена по движению, а вертикальная не
+	// даёт вклада в скалярное произведение с горизонтальным вектором.
+	const glm::vec3 side = glm::normalize(glm::cross(tangent, inward));
 
-        vkCmdDrawIndexed(fd.command_buffer, indicesPerTriangle, 1, offset, 0, 0);
-    }
+	// Столбцы матрицы — образы локальных осей. Локальная +Y (вершина) идёт
+	// вдоль движения, а локальная диагональ (X+Z)/√2 — проекция бокового
+	// ребра — смотрит на ось, поэтому к оси обращено ребро, а не грань.
+	// Конструкция даёт определитель +1: матрица остаётся поворотом и не
+	// переворачивает отсечение граней.
+	constexpr float invSqrt2 = 0.70710678118654752f;
 
-    vkCmdEndRenderPass(fd.command_buffer);
-    vkEndCommandBuffer(fd.command_buffer);
+	const glm::mat4 orientation{
+		glm::vec4((inward + side) * invSqrt2, 0.0f),  // образ локальной X
+		glm::vec4(tangent, 0.0f),                     // образ локальной Y
+		glm::vec4((inward - side) * invSqrt2, 0.0f),  // образ локальной Z
+		glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
+	};
+
+	glm::mat4 local = glm::mat4(1.0f);
+
+	local = glm::scale(local, state.scale);
+	local = glm::rotate(local, glm::radians(state.rotationDegrees.x), glm::vec3(1.0f, 0.0f, 0.0f));
+	local = glm::rotate(local, glm::radians(state.rotationDegrees.y), glm::vec3(0.0f, 1.0f, 0.0f));
+	local = glm::rotate(local, glm::radians(state.rotationDegrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
+
+	// Позиция применяется в мировом пространстве последней, иначе повороты
+	// и масштаб сдвинут центр орбиты за собой.
+	const glm::mat4 model =
+		glm::translate(glm::mat4(1.0f), objectPosition) * orientation * local;
+
+	const glm::mat4 transform = projection * view * model;
+
+	const Transform pcData{
+		.modelViewProjection = transform,
+		.color = state.tint,
+	};
+
+	vkCmdPushConstants(fd.command_buffer, pipelineLayout,
+	                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	                   0, sizeof(Transform), &pcData);
+
+	vkCmdDrawIndexed(fd.command_buffer,
+	                 static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+
+	vkCmdEndRenderPass(fd.command_buffer);
+	vkEndCommandBuffer(fd.command_buffer);
 }
 
 } // namespace application
